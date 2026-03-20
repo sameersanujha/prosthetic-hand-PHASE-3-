@@ -1,0 +1,235 @@
+#include <Arduino_ESP32_OTA.h>
+
+#if defined(ESP32)
+#include <ESP32Servo.h>
+#else
+#include <Servo.h>
+#endif
+
+#include <Wire.h>
+
+// ================= SERVO PINS =================
+#define NUM_FINGER_SERVOS 5
+
+int servoPins[NUM_FINGER_SERVOS] = {13, 12, 14, 27, 26};
+#define WRIST_SERVO_PIN 25
+
+Servo fingerServos[NUM_FINGER_SERVOS];
+Servo wristServo;
+
+// ================= EMG PARAMETERS =================
+#define WINDOW_DURATION 200
+#define NUM_SAMPLES 100
+#define SAMPLE_RATE 500
+#define BAUD_RATE 9600
+
+#define INPUT_PIN 34   // ✅ Correct ESP32 ADC
+
+#define BUFFER_SIZE 128
+
+// 🔥 FIXED RANGE (important)
+#define EMG_MIN 20
+#define EMG_MAX 600
+
+float emgBuffer[NUM_SAMPLES];
+int circular_buffer[BUFFER_SIZE] = {0};
+
+int data_index = 0;
+int sum = 0;
+int sampleCount = 0;
+
+float Q = 0.006, R = 1, x = 0, P = 1, K = 0;
+
+// ================= MPU =================
+const int MPU_ADDR = 0x68;
+int16_t accZ;
+float angle;
+
+const int sampleCountMPU = 10;
+float angleBuffer[sampleCountMPU];
+int bufferIndex = 0;
+unsigned long lastSampleTimeMPU = 0;
+
+const int numDiscreteAngles = 3;
+int discreteAngles[numDiscreteAngles] = {45, 135, 180};
+
+// ================= MODES =================
+bool onMode = false;
+bool gestureMode = false;
+bool grabMode = false;
+
+unsigned long grabStartTime = 0;
+bool grabTimerActive = false;
+
+// ================= EMG FUNCTIONS =================
+int getEnvelop(int abs_emg)
+{
+  sum -= circular_buffer[data_index];
+  sum += abs_emg;
+
+  circular_buffer[data_index] = abs_emg;
+  data_index = (data_index + 1) % BUFFER_SIZE;
+
+  return (sum / BUFFER_SIZE) * 2;
+}
+
+float EMGFilter(float input)
+{
+  float output = input;
+
+  {
+    static float z1, z2;
+    float x = output - 0.05159732*z1 - 0.36347401*z2;
+    output = 0.01856301*x + 0.03712602*z1 + 0.01856301*z2;
+    z2 = z1;
+    z1 = x;
+  }
+
+  {
+    static float z1, z2;
+    float x = output - -0.53945795*z1 - 0.39764934*z2;
+    output = x - 2*z1 + z2;
+    z2 = z1;
+    z1 = x;
+  }
+
+  {
+    static float z1, z2;
+    float x = output - 0.47319594*z1 - 0.70744137*z2;
+    output = x + 2*z1 + z2;
+    z2 = z1;
+    z1 = x;
+  }
+
+  {
+    static float z1, z2;
+    float x = output - -1.00211112*z1 - 0.74520226*z2;
+    output = x - 2*z1 + z2;
+    z2 = z1;
+    z1 = x;
+  }
+
+  return output;
+}
+
+// ================= MPU =================
+int16_t readAccZ()
+{
+  Wire.beginTransmission(MPU_ADDR);
+  Wire.write(0x3F);
+  Wire.endTransmission(false);
+  Wire.requestFrom(MPU_ADDR, 2, true);
+
+  return Wire.read() << 8 | Wire.read();
+}
+
+// ================= SETUP =================
+void setup()
+{
+  Serial.begin(BAUD_RATE);
+  Wire.begin();
+
+  Wire.beginTransmission(MPU_ADDR);
+  Wire.write(0x6B);
+  Wire.write(0);
+  Wire.endTransmission(true);
+
+  for (int i = 0; i < NUM_FINGER_SERVOS; i++)
+    fingerServos[i].attach(servoPins[i]);
+
+  wristServo.attach(WRIST_SERVO_PIN);
+}
+
+// ================= LOOP =================
+void loop()
+{
+  handleMPU();
+  handleEMG();
+}
+
+// ================= MPU =================
+void handleMPU()
+{
+  if (millis() - lastSampleTimeMPU >= 100)
+  {
+    lastSampleTimeMPU = millis();
+
+    accZ = readAccZ();
+
+    angle = (float)(accZ - 14000) * 180.0 / (-18000 - 14000);
+    angle = constrain(angle, 0, 180);
+
+    angleBuffer[bufferIndex++] = angle;
+
+    if (bufferIndex >= sampleCountMPU)
+    {
+      float sumAngle = 0;
+      for (int i = 0; i < sampleCountMPU; i++)
+        sumAngle += angleBuffer[i];
+
+      float meanAngle = sumAngle / sampleCountMPU;
+
+      int closest = discreteAngles[0];
+      int minDiff = abs(meanAngle - closest);
+
+      for (int i = 1; i < numDiscreteAngles; i++)
+      {
+        int diff = abs(meanAngle - discreteAngles[i]);
+        if (diff < minDiff)
+        {
+          minDiff = diff;
+          closest = discreteAngles[i];
+        }
+      }
+
+      wristServo.write(closest);
+      bufferIndex = 0;
+    }
+  }
+}
+
+// ================= EMG =================
+void handleEMG()
+{
+  static unsigned long lastMicros = 0;
+
+  if (micros() - lastMicros >= 1000000 / SAMPLE_RATE)
+  {
+    lastMicros = micros();
+
+    int sensor = analogRead(INPUT_PIN);
+    float filtered = EMGFilter(sensor);
+    int env = getEnvelop(abs(filtered));
+
+    Serial.println(env);  // 🔥 DEBUG
+
+    int mappedVal = map(env, EMG_MIN, EMG_MAX, 0, 180);
+    mappedVal = constrain(mappedVal, 0, 180);
+
+    // Kalman
+    float x_pred = x;
+    float P_pred = P + Q;
+
+    K = P_pred / (P_pred + R);
+    x = x_pred + K * (mappedVal - x_pred);
+    P = (1 - K) * P_pred;
+
+    int meanEMG = x;
+
+    if (sampleCount < NUM_SAMPLES)
+      emgBuffer[sampleCount++] = meanEMG;
+
+    if (sampleCount >= NUM_SAMPLES)
+    {
+      float sum = 0;
+      for (int i = 0; i < NUM_SAMPLES; i++)
+        sum += emgBuffer[i];
+
+      float controlValue = sum / NUM_SAMPLES;
+
+      Serial.println(controlValue);
+
+      sampleCount = 0;
+    }
+  }
+}
