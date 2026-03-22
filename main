@@ -1,0 +1,326 @@
+#include <Arduino_ESP32_OTA.h>
+
+#if defined(ESP32)
+#include <ESP32Servo.h>
+#else
+#include <Servo.h>
+#endif
+
+#include <Wire.h>
+
+// ================= SERVO PINS =================
+#define NUM_FINGER_SERVOS 5
+int servoPins[NUM_FINGER_SERVOS] = {13, 12, 14, 27, 26};
+#define WRIST_SERVO_PIN 25
+
+const int numDiscreteAngles = 3;
+int discreteAngles[numDiscreteAngles] = {45, 135, 180};
+
+Servo fingerServos[NUM_FINGER_SERVOS];
+Servo wristServo;
+
+// ================= EMG PARAMETERS =================
+#define WINDOW_DURATION 200
+#define NUM_SAMPLES 100
+#define SAMPLE_RATE 500
+#define BAUD_RATE 9600
+#define INPUT_PIN 34   // ✅ ESP32 ADC pin
+#define BUFFER_SIZE 128
+#define EMG_MIN 2
+#define EMG_MAX 10
+
+float emgBuffer[NUM_SAMPLES];
+unsigned long sampleInterval;
+
+int circular_buffer[BUFFER_SIZE] = {0};
+int data_index = 0;
+int sum = 0;
+
+int sampleCount = 0;
+
+float Q = 0.006, R = 1, x = 0, P = 1, K = 0;
+
+// ================= MPU6050 =================
+const int MPU_ADDR = 0x68;
+int16_t accZ;
+float angle;
+
+const int sampleCountMPU = 10;
+float angleBuffer[sampleCountMPU];
+int bufferIndex = 0;
+unsigned long lastSampleTimeMPU = 0;
+
+// ================= MODES =================
+bool onMode = false;
+bool gestureMode = false;
+bool grabMode = false;
+
+unsigned long grabStartTime = 0;
+bool grabTimerActive = false;
+
+// ================= EMG FUNCTIONS =================
+int getEnvelop(int abs_emg)
+{
+  sum -= circular_buffer[data_index];
+  sum += abs_emg;
+
+  circular_buffer[data_index] = abs_emg;
+  data_index = (data_index + 1) % BUFFER_SIZE;
+
+  return (sum / BUFFER_SIZE) * 2;
+}
+
+float EMGFilter(float input)
+{
+  float output = input;
+
+  {
+    static float z1, z2;
+    float x = output - 0.05159732*z1 - 0.36347401*z2;
+    output = 0.01856301*x + 0.03712602*z1 + 0.01856301*z2;
+    z2 = z1; z1 = x;
+  }
+
+  {
+    static float z1, z2;
+    float x = output + 0.53945795*z1 - 0.39764934*z2;
+    output = x - 2*z1 + z2;
+    z2 = z1; z1 = x;
+  }
+
+  {
+    static float z1, z2;
+    float x = output - 0.47319594*z1 - 0.70744137*z2;
+    output = x + 2*z1 + z2;
+    z2 = z1; z1 = x;
+  }
+
+  {
+    static float z1, z2;
+    float x = output + 1.00211112*z1 - 0.74520226*z2;
+    output = x - 2*z1 + z2;
+    z2 = z1; z1 = x;
+  }
+
+  return output;
+}
+
+// ================= MPU FUNCTIONS =================
+int16_t readAccZ()
+{
+  Wire.beginTransmission(MPU_ADDR);
+  Wire.write(0x3F);
+  Wire.endTransmission(false);
+  Wire.requestFrom(MPU_ADDR, 2, true);
+
+  return Wire.read() << 8 | Wire.read();
+}
+
+// ================= SETUP =================
+void setup()
+{
+  Serial.begin(BAUD_RATE);
+  Wire.begin();
+
+  // Wake MPU6050
+  Wire.beginTransmission(MPU_ADDR);
+  Wire.write(0x6B);
+  Wire.write(0);
+  Wire.endTransmission(true);
+
+  // Attach servos
+  for(int i = 0; i < NUM_FINGER_SERVOS; i++)
+  {
+    fingerServos[i].attach(servoPins[i]);
+    fingerServos[i].write(0);
+  }
+
+  wristServo.attach(WRIST_SERVO_PIN);
+  wristServo.write(90);
+
+  sampleInterval = WINDOW_DURATION / NUM_SAMPLES;
+}
+
+// ================= LOOP =================
+void loop()
+{
+  handleMPU();
+  handleEMG();
+}
+
+// ================= MPU HANDLER =================
+void handleMPU()
+{
+  if(millis() - lastSampleTimeMPU >= 100)
+  {
+    lastSampleTimeMPU = millis();
+
+    accZ = readAccZ();
+
+    angle = (float)(accZ - 14000) * 180.0 / (-18000 - 14000);
+    angle = constrain(angle, 0, 180);
+
+    angleBuffer[bufferIndex++] = angle;
+
+    if(bufferIndex >= sampleCountMPU)
+    {
+      float sumAngle = 0;
+      for(int i = 0; i < sampleCountMPU; i++)
+        sumAngle += angleBuffer[i];
+
+      float meanAngle = sumAngle / sampleCountMPU;
+
+      int closestAngle = discreteAngles[0];
+      int minDiff = abs(meanAngle - discreteAngles[0]);
+
+      for(int i = 1; i < numDiscreteAngles; i++)
+      {
+        int diff = abs(meanAngle - discreteAngles[i]);
+        if(diff < minDiff)
+        {
+          minDiff = diff;
+          closestAngle = discreteAngles[i];
+        }
+      }
+
+      wristServo.write(closestAngle);
+      bufferIndex = 0;
+    }
+  }
+}
+
+// ================= EMG HANDLER =================
+void handleEMG()
+{
+  static unsigned long pastMicros = 0;
+  unsigned long nowMicros = micros();
+  unsigned long interval = nowMicros - pastMicros;
+  pastMicros = nowMicros;
+
+  static long timer = 0;
+  timer -= interval;
+
+  if(timer < 0)
+  {
+    timer += 1000000 / SAMPLE_RATE;
+
+    int sensor_value = analogRead(INPUT_PIN);
+    float signal = EMGFilter(sensor_value);
+    int envelop = getEnvelop(abs(signal));
+
+    int servo_position = map(envelop, EMG_MIN, EMG_MAX, 0, 180);
+
+    // Kalman smoothing
+    float x_pred = x;
+    float P_pred = P + Q;
+
+    K = P_pred / (P_pred + R);
+    x = x_pred + K * (servo_position - x_pred);
+    P = (1 - K) * P_pred;
+
+    int meanEMG = x;
+
+    if(sampleCount < NUM_SAMPLES)
+    {
+      emgBuffer[sampleCount++] = meanEMG;
+    }
+
+    static bool muscleActive = false;
+
+    if(sampleCount >= NUM_SAMPLES)
+    {
+      float windowSum = 0;
+      for(int i = 0; i < NUM_SAMPLES; i++)
+        windowSum += emgBuffer[i];
+
+      float windowMean = windowSum / NUM_SAMPLES;
+
+      float controlValue = (gestureMode || grabMode) ? meanEMG : windowMean;
+
+      const int TRANSITION_THRESHOLD = 2400;
+      const int GRAB_LOW = 1000;
+      const int GRAB_HIGH = 1300;
+
+      Serial.println(controlValue);
+
+      // ===== MODE SWITCH =====
+      if(!muscleActive && controlValue >= TRANSITION_THRESHOLD)
+      {
+        muscleActive = true;
+
+        if(!onMode)
+        {
+          Serial.println("ON MODE");
+          onMode = true;
+          gestureMode = false;
+          grabMode = false;
+        }
+        else if(grabMode)
+        {
+          Serial.println("OBJECT PLACED");
+          grabMode = false;
+
+          for(int i=0;i<NUM_FINGER_SERVOS;i++)
+            fingerServos[i].write(0);
+
+          onMode = false;
+          gestureMode = false;
+        }
+        else if(!gestureMode)
+        {
+          Serial.println("GESTURE MODE");
+          gestureMode = true;
+        }
+        else
+        {
+          Serial.println("OFF");
+          onMode = false;
+          gestureMode = false;
+          grabMode = false;
+          return;
+        }
+      }
+
+      if(muscleActive && controlValue < TRANSITION_THRESHOLD)
+      {
+        muscleActive = false;
+      }
+
+      // ===== GRAB MODE =====
+      if(onMode && !gestureMode && !grabMode &&
+         windowMean >= GRAB_LOW && windowMean <= GRAB_HIGH)
+      {
+        if(!grabTimerActive)
+        {
+          grabTimerActive = true;
+          grabStartTime = millis();
+        }
+
+        if(millis() - grabStartTime >= 300)
+        {
+          Serial.println("GRAB MODE ACTIVATED");
+          grabMode = true;
+
+          // Close fingers
+          for(int i=0;i<NUM_FINGER_SERVOS;i++)
+            fingerServos[i].write(180);
+
+          grabTimerActive = false;
+        }
+      }
+      else
+      {
+        grabTimerActive = false;
+      }
+
+      // ===== NORMAL CONTROL =====
+      if(onMode && !gestureMode && !grabMode)
+      {
+        for(int i=0;i<NUM_FINGER_SERVOS;i++)
+          fingerServos[i].write(meanEMG);
+      }
+
+      sampleCount = 0;
+    }
+  }
+}
