@@ -7,7 +7,7 @@
 #endif
 
 #include <Wire.h>
-
+//new
 // ================= SERVO PINS =================
 #define NUM_FINGER_SERVOS 5
 int servoPins[NUM_FINGER_SERVOS] = {13, 12, 14, 27, 26};
