@@ -1,5 +1,5 @@
-#include <Arduino_ESP32_OTA.h>
-
+#include <WiFi.h>
+#include <WebServer.h>
 #if defined(ESP32)
 #include <ESP32Servo.h>
 #else
@@ -7,24 +7,37 @@
 #endif
 
 #include <Wire.h>
-//new
-// ================= SERVO PINS =================
-#define NUM_FINGER_SERVOS 5
-int servoPins[NUM_FINGER_SERVOS] = {13, 12, 14, 27, 26};
-#define WRIST_SERVO_PIN 25
 
-const int numDiscreteAngles = 3;
-int discreteAngles[numDiscreteAngles] = {45, 135, 180};
+// ================= SERVO PINS =================
+#define NUM_FINGER_SERVOS 3
+int servoPins[NUM_FINGER_SERVOS] = {13, 27, 14};
+#define WRIST_SERVO_PIN 25
 
 Servo fingerServos[NUM_FINGER_SERVOS];
 Servo wristServo;
+
+// 🔥 SMOOTHING ARRAYS
+int currentAngles[NUM_FINGER_SERVOS] = {0};
+int targetAngles[NUM_FINGER_SERVOS] = {0};
+const int STEP = 20;   // speed (3–8 ideal)
+
+// ================= WIFI =================
+const char* ssid = "";
+const char* password = "";
+
+WebServer server(80);
+
+// ================= APP COMM =================
+String command = "none";
+String currentGesture = "";
+bool appMode = false;
 
 // ================= EMG PARAMETERS =================
 #define WINDOW_DURATION 200
 #define NUM_SAMPLES 100
 #define SAMPLE_RATE 500
 #define BAUD_RATE 9600
-#define INPUT_PIN 34   // ✅ ESP32 ADC pin
+#define INPUT_PIN 34
 #define BUFFER_SIZE 128
 #define EMG_MIN 2
 #define EMG_MAX 10
@@ -40,16 +53,6 @@ int sampleCount = 0;
 
 float Q = 0.006, R = 1, x = 0, P = 1, K = 0;
 
-// ================= MPU6050 =================
-const int MPU_ADDR = 0x68;
-int16_t accZ;
-float angle;
-
-const int sampleCountMPU = 10;
-float angleBuffer[sampleCountMPU];
-int bufferIndex = 0;
-unsigned long lastSampleTimeMPU = 0;
-
 // ================= MODES =================
 bool onMode = false;
 bool gestureMode = false;
@@ -58,7 +61,26 @@ bool grabMode = false;
 unsigned long grabStartTime = 0;
 bool grabTimerActive = false;
 
-// ================= EMG FUNCTIONS =================
+// ================= ROUTES =================
+void setupRoutes()
+{
+  server.on("/gesture", []() {
+    if(server.hasArg("name"))
+    {
+      currentGesture = server.arg("name");
+      Serial.println("Gesture: " + currentGesture);
+    }
+    server.send(200, "text/plain", "OK");
+  });
+
+  server.on("/status", []() {
+    server.send(200, "text/plain", command);
+    Serial.println("Status sent: " + command);
+    
+  });
+}
+
+// ================= EMG =================
 int getEnvelop(int abs_emg)
 {
   sum -= circular_buffer[data_index];
@@ -105,34 +127,106 @@ float EMGFilter(float input)
   return output;
 }
 
-// ================= MPU FUNCTIONS =================
-int16_t readAccZ()
+// ================= SMOOTH SERVO UPDATE =================
+void updateServosSmooth()
 {
-  Wire.beginTransmission(MPU_ADDR);
-  Wire.write(0x3F);
-  Wire.endTransmission(false);
-  Wire.requestFrom(MPU_ADDR, 2, true);
+  for(int i=0;i<NUM_FINGER_SERVOS;i++)
+  {
+    if(currentAngles[i] < targetAngles[i])
+      currentAngles[i] = min(currentAngles[i] + STEP, targetAngles[i]);
+    else if(currentAngles[i] > targetAngles[i])
+      currentAngles[i] = max(currentAngles[i] - STEP, targetAngles[i]);
 
-  return Wire.read() << 8 | Wire.read();
+    fingerServos[i].write(currentAngles[i]);
+  }
+}
+
+void sendAngles()
+{
+  Serial.print(currentAngles[0]);
+  Serial.print(",");
+  Serial.print(currentAngles[1]);
+  Serial.print(",");
+  Serial.println(currentAngles[2]);
+}
+
+// ================= APP GESTURES =================
+void handleAppGestures()
+{
+  if(currentGesture == "") return;
+
+  if(currentGesture == "V")
+  {
+    targetAngles[0]=0;
+    targetAngles[1]=180;
+    targetAngles[2]=0;
+  }
+  else if(currentGesture == "GOOD")
+  {
+    targetAngles[0]=180;
+    targetAngles[1]=0;
+    targetAngles[2]=0;
+  }
+  else if(currentGesture == "PINCH")
+  {
+    targetAngles[0]=0;
+    targetAngles[1]=0;
+    targetAngles[2]=180;
+  }
+  else if(currentGesture == "PUNCH")
+  {
+    targetAngles[0]=180;
+    targetAngles[1]=180;
+    targetAngles[2]=180;
+  }
+  else if(currentGesture == "YO")
+  {
+    targetAngles[0]=180;
+    targetAngles[1]=0;
+    targetAngles[2]=180;
+  }
+  else 
+  {
+    targetAngles[0]=0;
+    targetAngles[1]=0;
+    targetAngles[2]=0;
+  }
+
+  currentGesture = "";  // execute once
 }
 
 // ================= SETUP =================
 void setup()
 {
   Serial.begin(BAUD_RATE);
+
+  WiFi.begin(ssid, password);
+  Serial.print("Connecting");
+
+  while (WiFi.status() != WL_CONNECTED)
+  {
+    delay(500);
+    Serial.print(".");
+  }
+
+  Serial.println("\nConnected!");
+  Serial.print("ESP IP: ");
+  Serial.println(WiFi.localIP());
+
+  setupRoutes();
+  server.begin();
+
   Wire.begin();
-
-  // Wake MPU6050
-  Wire.beginTransmission(MPU_ADDR);
-  Wire.write(0x6B);
-  Wire.write(0);
-  Wire.endTransmission(true);
-
-  // Attach servos
+  ESP32PWM::allocateTimer(0);
+  ESP32PWM::allocateTimer(1);
+  ESP32PWM::allocateTimer(2);
+  ESP32PWM::allocateTimer(3);
   for(int i = 0; i < NUM_FINGER_SERVOS; i++)
   {
     fingerServos[i].attach(servoPins[i]);
     fingerServos[i].write(0);
+    currentAngles[i] = 0;
+    targetAngles[i] = 180;
   }
 
   wristServo.attach(WRIST_SERVO_PIN);
@@ -144,51 +238,18 @@ void setup()
 // ================= LOOP =================
 void loop()
 {
-  handleMPU();
-  handleEMG();
+  server.handleClient();
+
+  handleEMG();           // 🔥 ALWAYS RUN
+
+  if(appMode)
+    handleAppGestures();
+
+  updateServosSmooth();
+//  sendAngles();   // 🔥 SEND TO ARDUINO
+
+  
 }
-
-// ================= MPU HANDLER =================
-void handleMPU()
-{
-  if(millis() - lastSampleTimeMPU >= 100)
-  {
-    lastSampleTimeMPU = millis();
-
-    accZ = readAccZ();
-
-    angle = (float)(accZ - 14000) * 180.0 / (-18000 - 14000);
-    angle = constrain(angle, 0, 180);
-
-    angleBuffer[bufferIndex++] = angle;
-
-    if(bufferIndex >= sampleCountMPU)
-    {
-      float sumAngle = 0;
-      for(int i = 0; i < sampleCountMPU; i++)
-        sumAngle += angleBuffer[i];
-
-      float meanAngle = sumAngle / sampleCountMPU;
-
-      int closestAngle = discreteAngles[0];
-      int minDiff = abs(meanAngle - discreteAngles[0]);
-
-      for(int i = 1; i < numDiscreteAngles; i++)
-      {
-        int diff = abs(meanAngle - discreteAngles[i]);
-        if(diff < minDiff)
-        {
-          minDiff = diff;
-          closestAngle = discreteAngles[i];
-        }
-      }
-
-      wristServo.write(closestAngle);
-      bufferIndex = 0;
-    }
-  }
-}
-
 // ================= EMG HANDLER =================
 void handleEMG()
 {
@@ -210,7 +271,6 @@ void handleEMG()
 
     int servo_position = map(envelop, EMG_MIN, EMG_MAX, 0, 180);
 
-    // Kalman smoothing
     float x_pred = x;
     float P_pred = P + Q;
 
@@ -221,9 +281,7 @@ void handleEMG()
     int meanEMG = x;
 
     if(sampleCount < NUM_SAMPLES)
-    {
       emgBuffer[sampleCount++] = meanEMG;
-    }
 
     static bool muscleActive = false;
 
@@ -239,11 +297,10 @@ void handleEMG()
 
       const int TRANSITION_THRESHOLD = 2400;
       const int GRAB_LOW = 1000;
-      const int GRAB_HIGH = 1300;
-
+      const int GRAB_HIGH = 2000;
+     
       Serial.println(controlValue);
 
-      // ===== MODE SWITCH =====
       if(!muscleActive && controlValue >= TRANSITION_THRESHOLD)
       {
         muscleActive = true;
@@ -261,7 +318,7 @@ void handleEMG()
           grabMode = false;
 
           for(int i=0;i<NUM_FINGER_SERVOS;i++)
-            fingerServos[i].write(0);
+            targetAngles[i]=0;
 
           onMode = false;
           gestureMode = false;
@@ -270,6 +327,8 @@ void handleEMG()
         {
           Serial.println("GESTURE MODE");
           gestureMode = true;
+          command = "on";
+          appMode = true;
         }
         else
         {
@@ -277,16 +336,15 @@ void handleEMG()
           onMode = false;
           gestureMode = false;
           grabMode = false;
+          command = "off";
+          appMode = false;
           return;
         }
       }
 
       if(muscleActive && controlValue < TRANSITION_THRESHOLD)
-      {
         muscleActive = false;
-      }
 
-      // ===== GRAB MODE =====
       if(onMode && !gestureMode && !grabMode &&
          windowMean >= GRAB_LOW && windowMean <= GRAB_HIGH)
       {
@@ -301,9 +359,8 @@ void handleEMG()
           Serial.println("GRAB MODE ACTIVATED");
           grabMode = true;
 
-          // Close fingers
           for(int i=0;i<NUM_FINGER_SERVOS;i++)
-            fingerServos[i].write(180);
+            targetAngles[i]=180;
 
           grabTimerActive = false;
         }
@@ -313,14 +370,8 @@ void handleEMG()
         grabTimerActive = false;
       }
 
-      // ===== NORMAL CONTROL =====
-      if(onMode && !gestureMode && !grabMode)
-      {
-        for(int i=0;i<NUM_FINGER_SERVOS;i++)
-          fingerServos[i].write(meanEMG);
-      }
-
       sampleCount = 0;
     }
   }
 }
+//final code
